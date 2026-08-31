@@ -65,7 +65,7 @@ except ImportError:  # 兜底：平铺目录导入
     from notifier import Notifier
     from storage import LurkerStorage, new_member_record
 
-PLUGIN_VERSION = "v1.0.0"
+PLUGIN_VERSION = "v1.0.1"
 
 DAY_SECONDS = 86400
 

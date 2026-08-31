@@ -65,7 +65,7 @@ except ImportError:  # 兜底：平铺目录导入
     from notifier import Notifier
     from storage import LurkerStorage, new_member_record
 
-PLUGIN_VERSION = "v1.0.1"
+PLUGIN_VERSION = "v1.0.2"
 
 DAY_SECONDS = 86400
 
@@ -272,15 +272,14 @@ class LurkerWatcherPlugin(Star):
                 rec["role"] = role
                 mapping[uid] = rec
             else:
-                # 新纳管：尽量用 OneBot 提供的 last_sent_time 还原真实潜水时长；
-                # 没有发言记录（last_sent_time=0）则从现在起算（给予宽限）。
-                last_sent = 0.0
-                try:
-                    last_sent = float(m.get("last_sent_time") or 0)
-                except (TypeError, ValueError):
-                    last_sent = 0.0
-                last_msg = last_sent if 0 < last_sent <= now else now
-                mapping[uid] = new_member_record(now, last_msg, username, role)
+                # 新纳管：一律从当前时间起算（完全宽限）。
+                # 不采信协议端的 last_sent_time：该字段在部分协议端实现中不可靠
+                # （恒为 0 或过期），且机器人入群前的历史无法核实——以其作为
+                # 惩罚依据会造成"刚入群就误读潜水状态"的误判。
+                # 只有机器人自己观察到的沉默才计入潜水天数；
+                # /lurker init 重初始化时，已跟踪成员的历史活跃数据仍会保留
+                # （那是机器人观测到的真实数据，见上方 existing 分支）。
+                mapping[uid] = new_member_record(now, now, username, role)
 
         self.storage.init_members(gid, mapping)
         self.storage.upsert_group(gid, info.get("platform_id", ""), info.get("group_name", ""))

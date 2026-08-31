@@ -31,6 +31,7 @@ scope_id=plugin_id（即 "作者/插件名"），随插件/机器人重启持久
         并在关键动作（初始化/踢出/改配置）和插件 terminate() 时强制落盘。
 """
 
+import copy
 import logging
 
 logger = logging.getLogger("astrbot")
@@ -52,12 +53,18 @@ def k_group_meta(gid: str) -> str:
     return f"lurker:group_meta:{gid}"
 
 
-def new_member_record(first_seen: float, last_message_time: float, username: str) -> dict:
-    """构造一条新的成员记录（字段与需求文档定义保持一致，并追加两个运维字段）。"""
+def new_member_record(
+    first_seen: float,
+    last_message_time: float,
+    username: str,
+    role: str = "member",
+) -> dict:
+    """构造一条新的成员记录（字段与需求文档定义保持一致，并追加运维字段）。"""
     return {
         "first_seen": first_seen,          # 首次纳入监控的时间戳（秒）
         "last_message_time": last_message_time,  # 最后一次发言的时间戳（秒）
         "username": username or "",        # 群名片 / 昵称
+        "role": role or "member",          # 群身份：owner / admin / member（owner、admin 不参与警告/踢出）
         "warned_at": None,                 # 上次被 @ 警告的时间戳；None 表示从未警告
         "evaluated_at": None,              # 上次进入踢人评估的时间戳
         "kick_fails": 0,                   # 连续踢出失败次数（机器人无管理员权限等）
@@ -97,26 +104,30 @@ class LurkerStorage:
         logger.info(f"[lurker_watcher] 存储载入完成：{len(self._index)} 个群，{total} 名成员")
 
     async def flush(self):
-        """把所有脏 key 批量写回 KV 存储。"""
+        """把所有脏 key 批量写回 KV 存储。
+
+        注意：这里必须深拷贝后再交给异步 KV 写入——落盘期间消息监听可能
+        并发修改同一个 dict，直接传引用可能导致序列化到一半的数据被改写。
+        """
         if not self._dirty:
             return
         for key in list(self._dirty):
             try:
                 if key == K_INDEX:
-                    await self._star.put_kv_data(key, self._index)
+                    await self._star.put_kv_data(key, copy.deepcopy(self._index))
                 elif key.startswith("lurker:members:"):
                     gid = key.split(":", 2)[2]
-                    await self._star.put_kv_data(key, self._members.get(gid, {}))
+                    await self._star.put_kv_data(key, copy.deepcopy(self._members.get(gid, {})))
                 elif key.startswith("lurker:group_config:"):
                     gid = key.split(":", 2)[2]
-                    await self._star.put_kv_data(key, self._group_configs.get(gid, {}))
+                    await self._star.put_kv_data(key, copy.deepcopy(self._group_configs.get(gid, {})))
                 elif key.startswith("lurker:group_meta:"):
                     gid = key.split(":", 2)[2]
-                    await self._star.put_kv_data(key, self._group_metas.get(gid, {}))
+                    await self._star.put_kv_data(key, copy.deepcopy(self._group_metas.get(gid, {})))
                 self._dirty.discard(key)
             except Exception as e:  # 单 key 失败不影响其他 key
                 logger.error(f"[lurker_watcher] 落盘失败 key={key}: {e}")
-        logger.debug(f"[lurker_watcher] 存储已落盘")
+        logger.debug("[lurker_watcher] 存储已落盘")
 
     # ------------------------------------------------------------------
     # 群索引

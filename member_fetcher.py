@@ -77,6 +77,19 @@ class MemberFetcher:
                 return adapter
         return None
 
+    async def get_bot_self_ids(self) -> set:
+        """获取所有机器人的自身 QQ 号（OneBot get_login_info），用于从监控中排除自己。"""
+        self_ids = set()
+        for adapter in self.list_adapters():
+            try:
+                info = await adapter.bot.call_action("get_login_info")
+                uid = str((info or {}).get("user_id", "")).strip()
+                if uid:
+                    self_ids.add(uid)
+            except Exception as e:
+                logger.debug(f"[lurker_watcher] 获取机器人自身账号失败: {e}")
+        return self_ids
+
     def has_adapter(self) -> bool:
         """是否存在可用的 aiocqhttp 适配器。"""
         return bool(self.list_adapters())

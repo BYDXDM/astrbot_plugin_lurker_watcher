@@ -21,9 +21,15 @@ DAY_SECONDS = 86400
 
 
 def fmt_days(days: float) -> str:
-    """把潜水天数格式化成人类可读文本：<1 天显示小时，≥10 天取整，其余保留 1 位小数。"""
+    """把潜水时长格式化成人类可读文本：
+    <1 小时显示分钟，<1 天显示小时，≥10 天取整，其余保留 1 位小数。
+    """
+    if days < 0:
+        days = 0
+    if days < 1 / 24:
+        return f"{max(1, int(days * 24 * 60))} 分钟"
     if days < 1:
-        return f"{max(0, int(days * 24))} 小时"
+        return f"{int(days * 24)} 小时"
     if days >= 10:
         return f"{int(days)} 天"
     return f"{days:.1f} 天"

@@ -47,7 +47,7 @@ import json
 import re
 import time
 import traceback
-from datetime import datetime
+from datetime import datetime, timedelta
 
 from astrbot.api import AstrBotConfig, logger
 from astrbot.api.event import AstrMessageEvent, filter
@@ -209,11 +209,13 @@ class LurkerWatcherPlugin(Star):
     async def _auto_init_task(self):
         """加载后自动拉取群列表与全量成员并纳入监控（带重试）。
 
-        平台 WebSocket 可能在插件加载时尚未连接完毕，因此允许重试。
+        协议端（NapCat 等）的 WebSocket 可能断线重连、或在插件加载后才连上，
+        因此持续重试约 7.5 分钟（30 次 × 15 秒）；期间日志降噪，每 5 次提示一次。
+        即使全部失败，机器人进群收到的首条消息也会触发 _maybe_adopt_group 自动纳管。
         """
-        max_attempts = 5
+        max_attempts = 30
         for attempt in range(1, max_attempts + 1):
-            await asyncio.sleep(min(5 * attempt, 30))  # 5/10/15/20/30 秒后再试
+            await asyncio.sleep(5 if attempt == 1 else 15)  # 首次 5 秒后尝试，之后每 15 秒
             try:
                 groups = await self.fetcher.get_group_list()
             except Exception:
@@ -230,15 +232,18 @@ class LurkerWatcherPlugin(Star):
                         inited += 1
                         total_members += len(self.storage.get_members(gid))
                 logger.info(
-                    f"[lurker_watcher] 自动初始化完成：{inited} 个群，{total_members} 名成员纳入监控"
+                    f"[lurker_watcher] 自动初始化完成（第 {attempt} 次尝试）："
+                    f"{inited} 个群，{total_members} 名成员纳入监控"
                 )
                 return
-            if not self.fetcher.has_adapter():
-                logger.warning(
-                    "[lurker_watcher] 未发现 aiocqhttp 平台适配器：群管理/成员拉取功能不可用，"
-                    "请确认已接入 NapCat/Lagrange 等 OneBot v11 协议端"
+            if attempt == 1 or attempt % 5 == 0:
+                tip = (
+                    "（未发现 aiocqhttp 平台适配器，请确认已接入 NapCat/Lagrange 等 OneBot v11 协议端）"
+                    if not self.fetcher.has_adapter()
+                    else "（协议端可能尚未连接就绪，继续等待）"
                 )
-        logger.warning("[lurker_watcher] 自动初始化未获取到任何群，可稍后手动执行 /lurker init")
+                logger.warning(f"[lurker_watcher] 暂未获取到群列表（第 {attempt}/{max_attempts} 次），{tip}")
+        logger.warning("[lurker_watcher] 自动初始化未获取到任何群，机器人收到群消息时会自动纳管，也可手动执行 /lurker init")
 
     async def _init_group(self, gid: str, info: dict) -> bool:
         """拉取单个群的全量成员并写入存储（保留已有成员的活跃数据）。"""
@@ -246,6 +251,9 @@ class LurkerWatcherPlugin(Star):
         members_raw = await self.fetcher.get_group_member_list(info.get("platform_id", ""), gid)
         if members_raw is None:
             return False
+        # 获取机器人自身 QQ 号（OneBot get_login_info），从监控表中排除，
+        # 避免把机器人自己统计成潜水成员甚至尝试踢出自己
+        self_ids = await self.fetcher.get_bot_self_ids()
         now = time.time()
         existing = self.storage.get_members(gid)
         mapping = {}
@@ -253,11 +261,15 @@ class LurkerWatcherPlugin(Star):
             uid = str(m.get("user_id", "")).strip()
             if not uid:
                 continue
+            if uid in self_ids:
+                continue  # 跳过机器人自己
             username = str(m.get("card") or m.get("nickname") or uid)
+            role = str(m.get("role") or "member")
             if uid in existing:
-                # 已纳管：只刷新昵称，保留历史活跃/警告状态
+                # 已纳管：刷新昵称/群身份，保留历史活跃/警告状态
                 rec = existing[uid]
                 rec["username"] = username
+                rec["role"] = role
                 mapping[uid] = rec
             else:
                 # 新纳管：尽量用 OneBot 提供的 last_sent_time 还原真实潜水时长；
@@ -268,7 +280,7 @@ class LurkerWatcherPlugin(Star):
                 except (TypeError, ValueError):
                     last_sent = 0.0
                 last_msg = last_sent if 0 < last_sent <= now else now
-                mapping[uid] = new_member_record(now, last_msg, username)
+                mapping[uid] = new_member_record(now, last_msg, username, role)
 
         self.storage.init_members(gid, mapping)
         self.storage.upsert_group(gid, info.get("platform_id", ""), info.get("group_name", ""))
@@ -298,9 +310,14 @@ class LurkerWatcherPlugin(Star):
                 # 未纳管的群（新入群 / 新增平台）：尝试在后台自动纳管
                 self._maybe_adopt_group(gid)
                 return
-            sender = getattr(event.message_obj, "sender", None)
+            # 群名片优先级：OneBot 原始消息的 sender.card（群名片）
+            # > AstrBotMessage.sender.card > nickname > 空串
             username = ""
-            if sender is not None:
+            raw = getattr(event.message_obj, "raw_message", None)
+            if isinstance(raw, dict):
+                username = str((raw.get("sender") or {}).get("card") or "")
+            sender = getattr(event.message_obj, "sender", None)
+            if not username and sender is not None:
                 username = (
                     getattr(sender, "card", None)
                     or getattr(sender, "nickname", None)
@@ -357,16 +374,32 @@ class LurkerWatcherPlugin(Star):
             return
         now = time.time()
         threshold = int(self.cfg.get_group("threshold_days", gid))
-        warning_days = int(self.cfg.get_group("warning_days", gid))
+        if threshold <= 0:
+            threshold = 7  # WebUI 脏配置兜底
+        # 预警天数必须小于阈值：脏配置（warning_days >= threshold）时自动钳制，
+        # 避免出现「潜水满 1 天就 @ 警告」的怪异行为
+        warning_days = min(int(self.cfg.get_group("warning_days", gid)), threshold - 1)
+        if warning_days < 0:
+            warning_days = 0
         warn_line = max(1, threshold - warning_days)
         whitelist = self.cfg.get_whitelist(gid)
         meta = self.storage.get_group_meta(gid)
+
+        # 防御：纳管时间丢失（数据迁移/损坏）时补写并跳过本轮踢人评估，
+        # 保证 24h 初始化保护期永远生效
+        initialized_at = meta.get("initialized_at") or 0
+        if not initialized_at:
+            self.storage.set_group_meta(gid, "initialized_at", now)
+            logger.warning(f"[lurker_watcher] 群 {gid} 缺少纳管时间，已补写并跳过本轮踢人评估")
+            initialized_at = now
 
         warn_candidates = []   # 预警区成员
         kick_candidates = []   # 达到阈值的成员
         for uid, rec in list(members.items()):
             if uid in whitelist:
                 continue  # 白名单不警告不踢
+            if str(rec.get("role") or "").lower() in ("owner", "admin"):
+                continue  # 群主/管理员：OneBot 无法踢出，不浪费警告与 LLM 评估
             try:
                 days = (now - float(rec.get("last_message_time") or now)) / DAY_SECONDS
             except (TypeError, ValueError):
@@ -392,8 +425,7 @@ class LurkerWatcherPlugin(Star):
             warned += 1
 
         # ---- 2. 踢人评估：初始化保护期后才开始，避免首轮误杀 ----
-        initialized_at = meta.get("initialized_at") or 0
-        if initialized_at and now - initialized_at < INIT_GRACE_SECONDS:
+        if now - initialized_at < INIT_GRACE_SECONDS:
             if kick_candidates:
                 logger.debug(f"[lurker_watcher] 群 {gid} 处于初始化保护期，本轮跳过 {len(kick_candidates)} 名候选")
             return
@@ -546,23 +578,41 @@ class LurkerWatcherPlugin(Star):
     # 每日报告
     # ==================================================================
     async def _daily_report_job(self):
-        """每分钟检查一次：某群到达报告时间（HH:MM）且今天未发过，则发送日报。
+        """每 60 秒检查一次：某群到达报告时间且今天未发过，则发送日报。
 
-        用「今天的目标时刻已过 && 今天还没发」判断，即使进程错过精确分钟
-        也能补发，且 last_report_date 保证每天最多一次。
+        判定规则：
+        * 今天已发过（last_report_date == 今天）-> 跳过；
+        * 今天已尝试过且失败（30 分钟内）-> 跳过，避免每分钟重试刷爆协议端；
+        * 今天的目标时刻已过：
+            - 有过历史报告（last_report_date 存在）：允许补发（覆盖机器人重启
+              错过报告时间的场景）；
+            - 全新安装（从未发过）：仅当处于 [目标时刻, 目标时刻+30分钟] 窗口内
+              才发送，避免「刚装好插件就收到一份过时日报」的突兀体验。
         """
         now = datetime.now()
         today = now.strftime("%Y-%m-%d")
+        now_ts = time.time()
         for gid, info in list(self.storage.list_groups().items()):
             if not self._is_monitored(gid):
                 continue
             hhmm = self.cfg.get_group("daily_report_time", gid)
             target = datetime.strptime(f"{today} {hhmm}", "%Y-%m-%d %H:%M")
             meta = self.storage.get_group_meta(gid)
-            if now < target or meta.get("last_report_date") == today:
+            if meta.get("last_report_date") == today:
+                continue  # 今天已发过
+            # 30 分钟内失败过则不再重试（last_report_attempt_ts 为时间戳）
+            if now_ts - float(meta.get("last_report_attempt_ts") or 0) < 1800:
                 continue
-            self.storage.set_group_meta(gid, "last_report_date", today)
-            await self._send_report(gid, info, title="群潜水监测日报")
+            if now < target:
+                continue  # 还没到点
+            if not meta.get("last_report_date") and now > target + timedelta(minutes=30):
+                continue  # 全新安装且已错过窗口：等明天
+            self.storage.set_group_meta(gid, "last_report_attempt_ts", now_ts)
+            ok = await self._send_report(gid, info, title="群潜水监测日报")
+            if ok:
+                self.storage.set_group_meta(gid, "last_report_date", today)
+            else:
+                logger.error(f"[lurker_watcher] 群 {gid} 日报发送失败，30 分钟后自动重试")
 
     async def _send_report(self, gid, info: dict, title: str) -> bool:
         """构建并发送某群的监测报告。"""
@@ -602,7 +652,8 @@ class LurkerWatcherPlugin(Star):
         if arg:
             if not arg.isdigit():
                 return "", "❌ 群号必须是纯数字，例如：/lurker list 123456789"
-            if not event.is_admin():
+            current = str(event.get_group_id() or "").strip()
+            if not event.is_admin() and arg != current:
                 return "", "🚫 查询其他群需要 AstrBot 管理员权限"
             if not self.storage.has_group(arg):
                 return "", f"❌ 群 {arg} 尚未被监控或未初始化，请先执行 /lurker init {arg}"
@@ -673,6 +724,10 @@ class LurkerWatcherPlugin(Star):
     @filter.permission_type(filter.PermissionType.ADMIN)
     async def lurker_set_threshold(self, event: AstrMessageEvent, days: str = "", group_id: str = ""):
         """设置潜水天数阈值（本群生效；可附带群号为指定群设置，写入群独立配置）"""
+        # 纵深防御：除框架级 permission_type 过滤外，handler 内部再校验一次
+        if not event.is_admin():
+            yield event.plain_result("🚫 该指令需要 AstrBot 管理员权限")
+            return
         days = days.strip()
         if not days.isdigit() or int(days) <= 0 or int(days) > 3650:
             yield event.plain_result("❌ 用法：/lurker set_threshold <天数>（1～3650 的整数）")
@@ -698,6 +753,9 @@ class LurkerWatcherPlugin(Star):
     @filter.permission_type(filter.PermissionType.ADMIN)
     async def lurker_set_warning(self, event: AstrMessageEvent, days: str = "", group_id: str = ""):
         """设置提前预警天数（本群生效；可附带群号为指定群设置）"""
+        if not event.is_admin():
+            yield event.plain_result("🚫 该指令需要 AstrBot 管理员权限")
+            return
         days = days.strip()
         if not days.isdigit() or int(days) > 365:
             yield event.plain_result("❌ 用法：/lurker set_warning <天数>（0～365 的整数）")
@@ -725,6 +783,9 @@ class LurkerWatcherPlugin(Star):
         self, event: AstrMessageEvent, action: str = "", target: str = ""
     ):
         """群级白名单管理：add/remove <@用户|QQ号> 或 show 查看当前名单"""
+        if not event.is_admin():
+            yield event.plain_result("🚫 该指令需要 AstrBot 管理员权限")
+            return
         gid = str(event.get_group_id() or "").strip()
         if not gid:
             yield event.plain_result("❌ 请在群聊中使用本指令（白名单按群独立维护）")
@@ -792,6 +853,9 @@ class LurkerWatcherPlugin(Star):
     @filter.permission_type(filter.PermissionType.ADMIN)
     async def lurker_init(self, event: AstrMessageEvent, group_id: str = ""):
         """重新拉取群成员并初始化（附带群号则只初始化该群，否则刷新所有受监控群）"""
+        if not event.is_admin():
+            yield event.plain_result("🚫 该指令需要 AstrBot 管理员权限")
+            return
         arg = str(group_id or "").strip()
         if arg:
             if not arg.isdigit():
@@ -854,6 +918,8 @@ class LurkerWatcherPlugin(Star):
             action(string): 裁决结果，只能填 "kick"（移出群聊）或 "keep"（保留）
             reason(string): 简短的裁决理由，会被公示到群里
         """
+        if self.storage is None or self.cfg is None:
+            return "插件尚未初始化完成，请稍后再试。"
         # 安全兜底：会话内触发的裁决必须来自 AstrBot 管理员，防止普通成员借 LLM 踢人
         if not event.is_admin():
             return "权限不足：只有 AstrBot 管理员可以执行踢人裁决。"

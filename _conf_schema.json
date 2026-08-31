@@ -51,5 +51,21 @@
         "description": "排行榜显示人数：每日报告与 /lurker list 中最多列出多少名潜水成员",
         "type": "int",
         "default": 10
+    },
+    "max_warns_per_round": {
+        "description": "每轮警告人数上限：0 = 不限制（预警区内所有人都会被 @ 警告）；设为正数可在大群限流防刷屏",
+        "type": "int",
+        "default": 0
+    },
+    "max_kick_evals_per_round": {
+        "description": "每轮踢人评估人数上限：0 = 不限制（所有达阈值成员都会进入评估）；设为正数可控制 LLM 调用量",
+        "type": "int",
+        "default": 0
+    },
+    "warn_template": {
+        "description": "预警 @ 警告文案模板：支持占位符 {name} 昵称、{days} 已潜水时长、{warn_line} 预警线天数、{threshold} 阈值天数、{remain} 距阈值剩余时长、{group} 群号；消息会自动 @ 该成员，无需在模板里写 @；支持多行",
+        "type": "text",
+        "default": "⚠️ 潜水预警：你已连续 {days} 未在本群发言（预警线 {warn_line} 天，阈值 {threshold} 天）。再潜水约 {remain} 将进入移出评估，快来冒个泡吧～",
+        "hint": "可用变量：{name} {days} {remain} {warn_line} {threshold} {group}；未知占位符会原样保留"
     }
 }

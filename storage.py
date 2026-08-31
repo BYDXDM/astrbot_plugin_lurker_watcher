@@ -106,24 +106,34 @@ class LurkerStorage:
     async def flush(self):
         """把所有脏 key 批量写回 KV 存储。
 
-        注意：这里必须深拷贝后再交给异步 KV 写入——落盘期间消息监听可能
-        并发修改同一个 dict，直接传引用可能导致序列化到一半的数据被改写。
+        并发安全：先把所有待写数据做一次统一的深拷贝快照，再逐个异步写入。
+        这样即使落盘期间有新消息并发修改内存，本次落盘的也是一组互相一致的数据。
         """
         if not self._dirty:
             return
+        pending = []
         for key in list(self._dirty):
             try:
                 if key == K_INDEX:
-                    await self._star.put_kv_data(key, copy.deepcopy(self._index))
+                    value = self._index
                 elif key.startswith("lurker:members:"):
                     gid = key.split(":", 2)[2]
-                    await self._star.put_kv_data(key, copy.deepcopy(self._members.get(gid, {})))
+                    value = self._members.get(gid, {})
                 elif key.startswith("lurker:group_config:"):
                     gid = key.split(":", 2)[2]
-                    await self._star.put_kv_data(key, copy.deepcopy(self._group_configs.get(gid, {})))
+                    value = self._group_configs.get(gid, {})
                 elif key.startswith("lurker:group_meta:"):
                     gid = key.split(":", 2)[2]
-                    await self._star.put_kv_data(key, copy.deepcopy(self._group_metas.get(gid, {})))
+                    value = self._group_metas.get(gid, {})
+                else:
+                    self._dirty.discard(key)
+                    continue
+                pending.append((key, copy.deepcopy(value)))
+            except Exception as e:
+                logger.error(f"[lurker_watcher] 快照失败 key={key}: {e}")
+        for key, value in pending:
+            try:
+                await self._star.put_kv_data(key, value)
                 self._dirty.discard(key)
             except Exception as e:  # 单 key 失败不影响其他 key
                 logger.error(f"[lurker_watcher] 落盘失败 key={key}: {e}")

@@ -14,6 +14,11 @@
     群独立覆盖值持久化在本插件的 KV 存储中（见 storage.py）。
 """
 
+DEFAULT_WARN_TEMPLATE = (
+    "⚠️ 潜水预警：你已连续 {days} 未在本群发言（预警线 {warn_line} 天，阈值 {threshold} 天）。"
+    "再潜水约 {remain} 将进入移出评估，快来冒个泡吧～"
+)
+
 # 与 _conf_schema.json 保持一致的兜底默认值。
 # 即使 AstrBotConfig 里缺失某个键（例如旧版本配置文件），也能安全取值。
 DEFAULTS = {
@@ -26,6 +31,9 @@ DEFAULTS = {
     "groups_to_monitor": [],    # 要监控的群号列表（空 = 全部）
     "whitelist": [],            # 全局白名单用户 ID
     "report_top_n": 10,         # 排行榜显示人数
+    "max_warns_per_round": 0,       # 每轮警告人数上限（0 = 不限制）
+    "max_kick_evals_per_round": 0,  # 每轮踢人评估人数上限（0 = 不限制）
+    "warn_template": DEFAULT_WARN_TEMPLATE,  # 预警文案模板（可含占位符）
 }
 
 # 允许被「群独立配置」覆盖的键（多群独立配置能力的核心）。
@@ -35,9 +43,13 @@ GROUP_OVERRIDABLE = frozenset({
     "warning_days",
     "enable_llm_decision",
     "warn_before_kick",
+    "max_warns_per_round",
+    "max_kick_evals_per_round",
+    "warn_template",
 })
 
-_INT_KEYS = frozenset({"threshold_days", "warning_days", "check_interval", "report_top_n"})
+_INT_KEYS = frozenset({"threshold_days", "warning_days", "check_interval", "report_top_n",
+                       "max_warns_per_round", "max_kick_evals_per_round"})
 _BOOL_KEYS = frozenset({"enable_llm_decision", "warn_before_kick"})
 _LIST_KEYS = frozenset({"groups_to_monitor", "whitelist"})
 _STR_KEYS = frozenset({"daily_report_time"})
@@ -125,6 +137,9 @@ class PluginConfig:
     def _sanitize(key, value):
         """按配置项类型清洗原始值，尽力兼容 WebUI / 手改配置文件的各种脏输入。"""
         try:
+            if key == "warn_template":
+                # 文案模板：保持原样（可为空，空则使用内置默认文案）
+                return str(value) if value is not None else ""
             if key in _INT_KEYS:
                 return int(str(value).strip())
             if key in _BOOL_KEYS:

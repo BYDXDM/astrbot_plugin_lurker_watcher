@@ -10,14 +10,36 @@ at() 的参数顺序是 name 在前、qq 在后）。
 """
 
 import logging
+import re
 import time
 from datetime import datetime
 
 from astrbot.api.event import MessageChain
 
+try:
+    from .config import DEFAULT_WARN_TEMPLATE
+except ImportError:  # 兜底：平铺目录导入
+    from config import DEFAULT_WARN_TEMPLATE
+
 logger = logging.getLogger("astrbot")
 
 DAY_SECONDS = 86400
+
+
+def render_template(template: str, variables: dict) -> str:
+    """安全的模板渲染：只替换 {变量名} 形式的占位符。
+
+    - 变量表里没有的占位符原样保留（如用户写了 {qq}）；
+    - 不平衡的花括号不会引发异常（不使用 str.format）。
+    """
+    if not template:
+        return ""
+
+    def _repl(m: "re.Match") -> str:
+        key = m.group(1)
+        return str(variables[key]) if key in variables else m.group(0)
+
+    return re.sub(r"\{(\w+)\}", _repl, template)
 
 
 def fmt_days(days: float) -> str:
@@ -139,17 +161,37 @@ class Notifier:
     # ------------------------------------------------------------------
     # @ 警告 / 最终通牒 / 移出通知
     # ------------------------------------------------------------------
-    def build_warn_chain(self, uid, username: str, days: float, threshold: int, warning_days: int) -> MessageChain:
-        """预警期 @ 警告消息链。"""
+    def build_warn_chain(
+        self,
+        uid,
+        username: str,
+        days: float,
+        threshold: int,
+        warning_days: int,
+        template: str = "",
+        group_id="",
+    ) -> MessageChain:
+        """预警期 @ 警告消息链。
+
+        template 为用户自定义文案模板（支持 {name} {days} {remain} {warn_line}
+        {threshold} {group} 占位符）；为空时使用内置默认文案。
+        消息会自动 @ 目标成员，模板中无需写 @。
+        """
         warn_line = max(1, threshold - warning_days)
         remain = max(0.1, threshold - days)
-        text = (
-            f" ⚠️ 潜水预警：你已连续 {fmt_days(days)} 未在本群发言"
-            f"（预警线 {warn_line} 天，阈值 {threshold} 天）。"
-            f"再潜水约 {fmt_days(remain)} 将进入移出评估，快来冒个泡吧～"
+        text = render_template(
+            template or DEFAULT_WARN_TEMPLATE,
+            {
+                "name": username or uid,
+                "days": fmt_days(days),
+                "remain": fmt_days(remain),
+                "warn_line": warn_line,
+                "threshold": threshold,
+                "group": str(group_id or ""),
+            },
         )
         # 注意 v4 MessageChain.at() 签名：at(name, qq)
-        return MessageChain().at(username or "", uid).message(text)
+        return MessageChain().at(username or "", uid).message(f" {text}")
 
     def build_final_warning_chain(self, uid, username: str, days: float, threshold: int, reason: str) -> MessageChain:
         """踢人前的最终警告消息链。"""

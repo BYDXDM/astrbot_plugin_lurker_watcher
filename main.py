@@ -65,7 +65,7 @@ except ImportError:  # 兜底：平铺目录导入
     from notifier import Notifier
     from storage import LurkerStorage, new_member_record
 
-PLUGIN_VERSION = "v1.0.2"
+PLUGIN_VERSION = "v1.0.3"
 
 DAY_SECONDS = 86400
 
@@ -73,9 +73,9 @@ DAY_SECONDS = 86400
 WARN_REPEAT_INTERVAL = DAY_SECONDS          # 同一成员两次 @ 警告的最小间隔
 KICK_RECHECK_INTERVAL = DAY_SECONDS         # 同一成员两次踢人评估的最小间隔
 INIT_GRACE_SECONDS = DAY_SECONDS            # 初始化保护期：纳管后 24h 内不踢人
-MAX_WARNS_PER_ROUND = 5                     # 每轮检查每群最多发出的警告数（防刷屏）
-MAX_KICK_EVALS_PER_ROUND = 3                # 每轮检查每群最多评估的成员数（控制 LLM 调用量）
 KICK_MAX_FAILS = 3                          # 连续踢出失败次数上限，超过则停止跟踪该成员
+# 每轮警告/评估人数上限已改为 WebUI 可配置项：
+#   max_warns_per_round / max_kick_evals_per_round（0 = 不限制，即预警区/达阈值的所有人）
 
 
 class PluginCronManager:
@@ -408,15 +408,24 @@ class LurkerWatcherPlugin(Star):
             elif days >= warn_line:
                 warn_candidates.append((days, uid, rec))
 
-        # ---- 1. 预警：@ 警告（每轮限量，防止大群刷屏） ----
+        # ---- 1. 预警：@ 警告（max_warns_per_round=0 表示不限量，默认全部警告） ----
+        max_warns = int(self.cfg.get_group("max_warns_per_round", gid))
         warned = 0
         for days, uid, rec in sorted(warn_candidates, key=lambda x: x[0], reverse=True):
-            if warned >= MAX_WARNS_PER_ROUND:
+            if max_warns > 0 and warned >= max_warns:
                 break
             last_warn = rec.get("warned_at") or 0
             if now - last_warn < WARN_REPEAT_INTERVAL:
                 continue  # 24h 内已警告过，不再重复打扰
-            chain = self.notifier.build_warn_chain(uid, rec.get("username", ""), days, threshold, warning_days)
+            chain = self.notifier.build_warn_chain(
+                uid,
+                rec.get("username", ""),
+                days,
+                threshold,
+                warning_days,
+                template=self.cfg.get_group("warn_template", gid),
+                group_id=gid,
+            )
             ok = await self.notifier.send_group_chain(info.get("platform_id", ""), gid, chain)
             if ok:
                 self.storage.set_member_fields(gid, uid, warned_at=now)
@@ -430,8 +439,10 @@ class LurkerWatcherPlugin(Star):
             return
 
         evaluated = 0
+        # max_kick_evals_per_round=0 表示不限量，默认所有达阈值成员都会进入评估
+        max_evals = int(self.cfg.get_group("max_kick_evals_per_round", gid))
         for days, uid, rec in sorted(kick_candidates, key=lambda x: x[0], reverse=True):
-            if evaluated >= MAX_KICK_EVALS_PER_ROUND:
+            if max_evals > 0 and evaluated >= max_evals:
                 break
             last_eval = rec.get("evaluated_at") or 0
             if now - last_eval < KICK_RECHECK_INTERVAL:
